@@ -374,6 +374,96 @@ def main() -> None:
     s, r = call("GET", f"/dossiers/API-DOSSIER-BAD-{run_id}")
     print("失败不留案卷（查询 404）:", s, r.get("error", {}).get("code"))
 
+    # 15) 案卷双人独立复核 + 第三人裁决（只依据案卷封存版本快照）
+    print("\n=== 案卷双人独立复核 ===")
+    # 15.0) 为复核另封存一卷（复用上面已补齐完整链的 code / code2，取各自最新版本）
+    review_dossier_id = f"API-REVIEW-DOS-{run_id}"
+    s, r = call("POST", "/dossiers", {
+        "dossier_id": review_dossier_id,
+        "items": [{"sample_code": code}, {"sample_code": code2}],
+    })
+    digest = r["dossier"]["digest"]
+    print(f"--- 复核专用案卷封存 [HTTP {s}] 摘要={digest} ---")
+
+    s, r = call("GET", f"/dossiers/{review_dossier_id}/reviews")
+    print(f"复核进度（未提交）[HTTP {s}] stage={r['stage']} review_count={r['review_count']}")
+
+    # 15.1) 摘要不一致 → 422 review_digest_mismatch（拒绝写入，不占用复核单号）
+    s, r = call("POST", f"/dossiers/{review_dossier_id}/reviews", {
+        "review_no": f"API-RV-BAD-{run_id}", "reviewer": "质控员甲",
+        "expected_digest": "0" * 64,
+        "items": [{"sample_code": code, "passed": True},
+                  {"sample_code": code2, "passed": True}]})
+    print("摘要不一致:", s, r.get("error", {}).get("code"))
+
+    # 15.2) 复核人甲提交第一份完整清单：code 通过、code2 通过
+    rv_no1 = f"API-RV-1-{run_id}"
+    s, r = call("POST", f"/dossiers/{review_dossier_id}/reviews", {
+        "review_no": rv_no1, "reviewer": "质控员甲",
+        "expected_digest": digest,
+        "items": [{"sample_code": code2, "passed": True},          # 顺序可与案卷清单不同
+                  {"sample_code": code, "passed": True}]})
+    print(f"第一份独立复核 [HTTP {s}] seq={r['submission']['seq']} stage={r['review']['stage']}")
+
+    # 同一复核人再次提交 → 409 duplicate_reviewer（两名复核人必须不同）
+    s, r = call("POST", f"/dossiers/{review_dossier_id}/reviews", {
+        "review_no": f"API-RV-DUP-{run_id}", "reviewer": "质控员甲",
+        "expected_digest": digest,
+        "items": [{"sample_code": code, "passed": True},
+                  {"sample_code": code2, "passed": True}]})
+    print("重复复核人:", s, r.get("error", {}).get("code"))
+
+    # 15.3) 复核人乙第二份：code 判不通过（与甲分歧），code2 仍通过（一致终局）
+    rv_no2 = f"API-RV-2-{run_id}"
+    s, r = call("POST", f"/dossiers/{review_dossier_id}/reviews", {
+        "review_no": rv_no2, "reviewer": "质控员乙",
+        "expected_digest": digest,
+        "items": [{"sample_code": code, "passed": False, "reason": "封签号与登记不符"},
+                  {"sample_code": code2, "passed": True}]})
+    print(f"第二份独立复核 [HTTP {s}] stage={r['review']['stage']} 分歧={r['review']['disputed_samples']}")
+
+    # 参与过前两次复核的人不得裁决
+    s, r = call("POST", f"/dossiers/{review_dossier_id}/reviews", {
+        "review_no": f"API-RV-ADJ-DUP-{run_id}", "reviewer": "质控员甲",
+        "expected_digest": digest,
+        "items": [{"sample_code": code, "passed": True}]})
+    print("前两名复核人试图裁决:", s, r.get("error", {}).get("code"))
+
+    # 15.4) 第三人（质控主管）裁决分歧份项：维持不通过 → 案卷不通过
+    rv_no3 = f"API-RV-3-{run_id}"
+    adj_body = {
+        "review_no": rv_no3, "reviewer": "质控主管丙",
+        "expected_digest": digest,
+        "items": [{"sample_code": code, "passed": False, "reason": "复核确认：封签号与登记不符"}],
+    }
+    s, r = call("POST", f"/dossiers/{review_dossier_id}/reviews", adj_body)
+    print(f"第三人裁决 [HTTP {s}] stage={r['review']['stage']}")
+    print("案卷终局结论:", r["review"]["conclusion"])
+
+    # 15.5) 同复核单号同内容重试 → 200 返回原结果（幂等）；异内容 → 409
+    s, r = call("POST", f"/dossiers/{review_dossier_id}/reviews", adj_body)
+    print(f"同号同内容重试 [HTTP {s}]（200=幂等，返回原结果）")
+    s, r = call("POST", f"/dossiers/{review_dossier_id}/reviews", {
+        "review_no": rv_no3, "reviewer": "质控主管丙",
+        "expected_digest": digest,
+        "items": [{"sample_code": code, "passed": True}]})
+    print("同复核单号异内容:", s, r.get("error", {}).get("code"))
+    # 终局后越阶段提交
+    s, r = call("POST", f"/dossiers/{review_dossier_id}/reviews", {
+        "review_no": f"API-RV-LATE-{run_id}", "reviewer": "质控员丁",
+        "expected_digest": digest,
+        "items": [{"sample_code": code, "passed": True}]})
+    print("案卷终局后再提交:", s, r.get("error", {}).get("code"))
+
+    # 15.6) 查询：进度、原始意见、分歧与终局结论
+    s, r = call("GET", f"/dossiers/{review_dossier_id}/reviews")
+    print(f"\n--- 复核查询 [HTTP {s}] stage={r['stage']} ---")
+    for it in r["items"]:
+        print(f"  {it['sample_code']}: {it['status']} final={it['final']}")
+        for o in it["opinions"]:
+            print(f"      seq{o['seq']} {o['kind']:<12} {o['reviewer']}: "
+                  f"{'通过' if o['passed'] else '不通过'} {o['reason'] or ''}")
+
 
 if __name__ == "__main__":
     main()

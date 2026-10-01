@@ -182,3 +182,46 @@ class DossierIn(BaseModel):
 
     dossier_id: str = Field(..., min_length=1, description="全局唯一案卷号，同号重试幂等")
     items: list[DossierItemIn] = Field(..., min_length=2, description="卷内样本（至少两份，编号不重复）")
+
+
+class ReviewItemIn(BaseModel):
+    """案卷复核清单中的一份意见：卷内样本编号 + 通过/不通过 + 不通过原因。
+
+    通过（passed=true）不得携带原因；不通过（passed=false）必须给出非空原因。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    sample_code: str = Field(..., min_length=1, description="卷内样本编号，须命中案卷封存清单")
+    passed: bool = Field(..., description="该份复核结论：true=通过，false=不通过")
+    reason: str | None = Field(None, description="不通过原因；通过时必须为空，不通过时必填")
+
+    @model_validator(mode="after")
+    def _check_reason(self) -> "ReviewItemIn":
+        if self.passed and self.reason is not None:
+            raise ValueError("通过的份项不得填写不通过原因（reason 必须为空）")
+        if not self.passed and not (self.reason and self.reason.strip()):
+            raise ValueError("不通过的份项必须填写非空不通过原因（reason）")
+        return self
+
+
+class ReviewIn(BaseModel):
+    """案卷复核意见提交（前两次为两名不同复核人的完整清单；第三次为第三人裁决）。
+
+    * expected_digest 必须与案卷封存摘要一致，否则拒绝写入（复核只依据封存版本快照）；
+    * 前两份意见由两名不同复核人各提交一次完整清单（覆盖卷内每份样本，不缺项/不重复份项）；
+    * 前两份都到齐后，仅对有分歧的份项开放第三人裁决：裁决人不得是前两次复核人之一，
+      裁决清单必须恰好覆盖全部分歧份项；全部份项终局后形成案卷结论；
+    * 意见提交后不可改；同复核单号同内容重试幂等返回原结果，异内容冲突；
+    * 越阶段提交（案卷终局后再提交、第二份未到就裁决、前两份缺漏时的裁决清单不全等）拒绝。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    review_no: str = Field(..., min_length=1, description="全局唯一复核单号，同号重试幂等")
+    reviewer: str = Field(..., min_length=1, description="复核人标识（工号/姓名等）")
+    expected_digest: str = Field(
+        ..., min_length=1,
+        description="提交方持有的案卷封存摘要（SHA-256，64 位十六进制）；与库存不一致则拒绝写入",
+    )
+    items: list[ReviewItemIn] = Field(..., min_length=1, description="逐份样本意见（前两次须完整覆盖案卷清单）")

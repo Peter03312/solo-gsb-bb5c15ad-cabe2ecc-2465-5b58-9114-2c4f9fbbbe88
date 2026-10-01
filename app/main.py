@@ -9,7 +9,8 @@ from fastapi.responses import JSONResponse
 from . import config
 from .db import db_session, init_db, row_to_dict
 from .dossiers import get_dossier, submit_dossier, verify_dossier
-from .schemas import ApproveIn, CorrectionIn, DossierIn, EventIn, SampleIn, TransferBatchIn
+from .reviews import get_review, submit_review
+from .schemas import ApproveIn, CorrectionIn, DossierIn, EventIn, ReviewIn, SampleIn, TransferBatchIn
 from .service import (
     DomainError,
     approve_storage,
@@ -45,7 +46,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="样本交接链核验服务",
     description="环境检测机构样本保管链（Chain of Custody）登记、事件核验、入库核定与版本化复核",
-    version="1.4.0",
+    version="1.5.0",
     lifespan=lifespan,
 )
 
@@ -283,3 +284,30 @@ def verify_dossier_api(dossier_id: str) -> dict[str, Any]:
     """案卷核验：按封存内容重算 SHA-256 摘要并返回一致与否（只读，不静默改写）。"""
     with db_session() as conn:
         return verify_dossier(conn, dossier_id)
+
+
+# --------------------------------------------------------------------------- 案卷双人独立复核
+
+@app.post(f"{API_PREFIX}/dossiers/{{dossier_id}}/reviews", tags=["reviews"], status_code=201)
+def submit_review_api(dossier_id: str, data: ReviewIn) -> JSONResponse:
+    """已封存案卷双人独立复核 / 第三人裁决提交。
+
+    * 提交必须携带案卷封存摘要 expected_digest，与库存摘要不一致拒绝写入；
+    * 前两份由两名不同复核人各提交一次覆盖卷内每份样本的完整清单，意见提交后不可改；
+    * 逐份意见一致即终局，分歧份项仅允许未参与前两次复核的第三人裁决；
+    * 全部份项终局后形成案卷结论，任一份不通过则案卷不通过；
+    * 同复核单号同内容重试 → 200 幂等返回原结果；异内容 → 409 review_conflict；
+    * 缺项 / 重复份项 / 重复复核人 / 越阶段提交拒绝且不留部分记录；
+    * 并发提交由 BEGIN IMMEDIATE 串行，按已提交状态判定。
+    """
+    with db_session(immediate=True) as conn:
+        body, idempotent = submit_review(conn, dossier_id, data)
+    body["idempotent"] = idempotent
+    return JSONResponse(status_code=200 if idempotent else 201, content=body)
+
+
+@app.get(f"{API_PREFIX}/dossiers/{{dossier_id}}/reviews", tags=["reviews"])
+def get_review_api(dossier_id: str) -> dict[str, Any]:
+    """案卷复核查询：复核进度、原始意见、分歧对照与终局结论（含逐份状态）。"""
+    with db_session() as conn:
+        return get_review(conn, dossier_id)

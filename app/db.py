@@ -108,8 +108,46 @@ CREATE TABLE IF NOT EXISTS dossier_item (
     UNIQUE (dossier_pk, sample_code)
 );
 
+-- 案卷双人独立复核（质控）：一个案卷对应一个复核案；前两份为两名不同复核人的
+-- 完整清单（seq 1/2，kind=review），有分歧的份项再由未参与前两次复核的第三人
+-- 裁决（seq 3，kind=adjudication，仅含分歧份项）。意见提交后不可改。
+CREATE TABLE IF NOT EXISTS review_case (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    dossier_pk    INTEGER NOT NULL UNIQUE REFERENCES dossier(id),
+    digest        TEXT NOT NULL,                       -- 首次提交时核对的案卷摘要副本
+    final_json    TEXT,                                -- 案卷终局结论（全部份项终局后固化，null=未终局）
+    finalized_at  TEXT,                                -- 案卷结论形成时间（UTC ISO8601）
+    created_at    TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS review (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    case_pk       INTEGER NOT NULL REFERENCES review_case(id),
+    review_no     TEXT NOT NULL UNIQUE,                -- 全局唯一复核单号（同号重试幂等/异内容冲突）
+    seq           INTEGER NOT NULL,                    -- 提交次序：1/2 独立复核，3 第三人裁决
+    kind          TEXT NOT NULL CHECK (kind IN ('review','adjudication')),
+    reviewer      TEXT NOT NULL,                       -- 复核人标识（前两份须不同，第三人须未参与前两次）
+    request_hash  TEXT NOT NULL,                       -- 请求指纹（同复核单号幂等/冲突判定）
+    created_at    TEXT NOT NULL,
+    UNIQUE (case_pk, seq),
+    UNIQUE (case_pk, reviewer)                         -- 复核人在同一案卷内不得重复（前两名互异、第三人未参与前两次）
+);
+
+CREATE TABLE IF NOT EXISTS review_opinion (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    review_pk        INTEGER NOT NULL REFERENCES review(id),
+    dossier_item_pk  INTEGER NOT NULL REFERENCES dossier_item(id),
+    sample_code      TEXT NOT NULL,                    -- 卷内样本编号（须命中封存清单）
+    item_index       INTEGER NOT NULL,                 -- 封存清单序号（0 起，按样本编号排序）
+    passed           INTEGER NOT NULL,                 -- 该份结论：1=通过，0=不通过
+    reason           TEXT,                             -- 不通过原因（通过为 NULL）
+    UNIQUE (review_pk, sample_code)
+);
+
 CREATE INDEX IF NOT EXISTS idx_event_sample_time ON custody_event(sample_id, occurred_at, id);
 CREATE INDEX IF NOT EXISTS idx_version_sample ON sample_version(sample_id, version);
+CREATE INDEX IF NOT EXISTS idx_review_case_dossier ON review_case(dossier_pk);
+CREATE INDEX IF NOT EXISTS idx_review_opinion_review ON review_opinion(review_pk, item_index);
 """
 
 # 依赖迁移新列的索引（须在旧库补列迁移完成后再创建）
