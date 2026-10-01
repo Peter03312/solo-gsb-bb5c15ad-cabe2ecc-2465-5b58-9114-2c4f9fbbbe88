@@ -9,7 +9,22 @@ from fastapi.responses import JSONResponse
 from . import config
 from .db import db_session, init_db, row_to_dict
 from .dossiers import get_dossier, submit_dossier, verify_dossier
-from .schemas import ApproveIn, CorrectionIn, DossierIn, EventIn, SampleIn, TransferBatchIn
+from .reviews import (
+    get_review_progress,
+    get_single_review,
+    submit_adjudication,
+    submit_review,
+)
+from .schemas import (
+    AdjudicationIn,
+    ApproveIn,
+    CorrectionIn,
+    DossierIn,
+    EventIn,
+    ReviewIn,
+    SampleIn,
+    TransferBatchIn,
+)
 from .service import (
     DomainError,
     approve_storage,
@@ -45,7 +60,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="样本交接链核验服务",
     description="环境检测机构样本保管链（Chain of Custody）登记、事件核验、入库核定与版本化复核",
-    version="1.4.0",
+    version="1.5.0",
     lifespan=lifespan,
 )
 
@@ -283,3 +298,52 @@ def verify_dossier_api(dossier_id: str) -> dict[str, Any]:
     """案卷核验：按封存内容重算 SHA-256 摘要并返回一致与否（只读，不静默改写）。"""
     with db_session() as conn:
         return verify_dossier(conn, dossier_id)
+
+
+# --------------------------------------------------------------------------- 案卷双人独立复核
+
+@app.post(f"{API_PREFIX}/dossiers/{{dossier_id}}/reviews", tags=["dossier-reviews"], status_code=201)
+def submit_review_api(dossier_id: str, data: ReviewIn) -> JSONResponse:
+    """已封存案卷双人独立复核：一名复核人一次提交卷内每份样本的完整结论清单。
+
+    * 复核只依据案卷封存的版本快照：提交前按 digest 核对案卷摘要，不一致拒绝写入；
+    * 每卷由两名不同复核人各提交一次（按提交先后记 seq=0/1），意见提交后不可改；
+    * 缺项、重复份项、卷外份项（422 review_rejected）、重复复核人（422 review_rejected）、
+      越阶段（409 review_stage_violation）整单拒绝，不留下部分记录；
+    * 同复核单号同内容重试 → 200 幂等返回原结果；异内容 → 409 review_conflict；
+    * 并发提交由 BEGIN IMMEDIATE 串行化，按已提交状态判定。
+    """
+    with db_session(immediate=True) as conn:
+        progress, idempotent = submit_review(conn, dossier_id, data)
+    return JSONResponse(status_code=200 if idempotent else 201,
+                        content={"review_progress": progress, "idempotent": idempotent})
+
+
+@app.get(f"{API_PREFIX}/dossiers/{{dossier_id}}/reviews", tags=["dossier-reviews"])
+def get_review_progress_api(dossier_id: str) -> dict[str, Any]:
+    """案卷复核进度：阶段、两名复核人原始意见、分歧份项、第三人裁决与逐份/案卷终局结论。"""
+    with db_session() as conn:
+        return {"review_progress": get_review_progress(conn, dossier_id)}
+
+
+@app.get(f"{API_PREFIX}/dossier-reviews/{{review_id}}", tags=["dossier-reviews"])
+def get_single_review_api(review_id: str) -> dict[str, Any]:
+    """按全局复核单号查询该次原始意见，并附所属案卷的当前复核进度。"""
+    with db_session() as conn:
+        return get_single_review(conn, review_id)
+
+
+@app.post(f"{API_PREFIX}/dossiers/{{dossier_id}}/adjudications", tags=["dossier-reviews"], status_code=201)
+def submit_adjudication_api(dossier_id: str, data: AdjudicationIn) -> JSONResponse:
+    """分歧份项的第三人裁决：两次复核完成后，由未参与前两次复核的第三人一次提交。
+
+    * items 必须恰好覆盖前两次复核有分歧的份项（缺项/重复/裁决无分歧份项整单拒绝）；
+    * 摘要不一致拒绝写入；裁决人参与过前两次复核 → 422 adjudication_rejected；
+    * 两次复核未完成或已终局 → 409 review_stage_violation；
+    * 同裁决单号同内容重试 → 200 幂等；异内容 → 409 adjudication_conflict；
+    * 裁决提交后全部份项终局，案卷结论形成（任一份不通过则案卷不通过）。
+    """
+    with db_session(immediate=True) as conn:
+        progress, idempotent = submit_adjudication(conn, dossier_id, data)
+    return JSONResponse(status_code=200 if idempotent else 201,
+                        content={"review_progress": progress, "idempotent": idempotent})

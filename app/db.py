@@ -108,8 +108,61 @@ CREATE TABLE IF NOT EXISTS dossier_item (
     UNIQUE (dossier_pk, sample_code)
 );
 
+-- 案卷复核（质控）：每卷由两名不同复核人各提交一次逐份完整清单（review），
+-- 意见提交后不可改；同复核单号同内容重试幂等、异内容冲突。
+-- 每卷至多两条 review 行；意见一致的份项即终局，分歧份项由第三人裁决（adjudication，至多一条）。
+CREATE TABLE IF NOT EXISTS dossier_review (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    review_id     TEXT NOT NULL UNIQUE,                -- 全局唯一复核单号
+    dossier_pk    INTEGER NOT NULL REFERENCES dossier(id),
+    dossier_id    TEXT NOT NULL,                       -- 提交时案卷号（留痕）
+    reviewer      TEXT NOT NULL,                       -- 复核人标识
+    seq           INTEGER NOT NULL,                   -- 该卷内复核次序（0/1）
+    digest_checked TEXT NOT NULL,                      -- 提交时核对的案卷摘要
+    request_hash  TEXT NOT NULL,                       -- 请求指纹（同复核单号幂等/冲突判定）
+    created_at    TEXT NOT NULL,
+    UNIQUE (dossier_pk, seq)
+);
+
+CREATE TABLE IF NOT EXISTS dossier_review_item (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    review_pk    INTEGER NOT NULL REFERENCES dossier_review(id),
+    dossier_pk   INTEGER NOT NULL REFERENCES dossier(id),
+    sample_code  TEXT NOT NULL,                        -- 卷内样本编号（须命中封存清单）
+    item_index   INTEGER NOT NULL,                     -- 按案卷清单排序的序号（0 起）
+    passed       INTEGER NOT NULL CHECK (passed IN (0,1)),  -- 1=通过 0=不通过
+    fail_reason  TEXT                                  -- 不通过原因（不通过时必填，通过时为 NULL）
+);
+
+-- 案卷第三人裁决：仅在两次复核均提交后、针对前两人有分歧的份项，一次提交完整裁决清单。
+-- 裁决人不得为前两次复核人；裁决提交后案卷终局，不可再写。
+CREATE TABLE IF NOT EXISTS dossier_adjudication (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    adjudication_id TEXT NOT NULL UNIQUE,              -- 全局唯一裁决复核单号
+    dossier_pk     INTEGER NOT NULL REFERENCES dossier(id),
+    dossier_id     TEXT NOT NULL,                      -- 提交时案卷号（留痕）
+    adjudicator    TEXT NOT NULL,                      -- 裁决人（不得参与前两次复核）
+    digest_checked TEXT NOT NULL,                      -- 提交时核对的案卷摘要
+    request_hash   TEXT NOT NULL,                      -- 请求指纹（同单号幂等/冲突判定）
+    created_at     TEXT NOT NULL,
+    UNIQUE (dossier_pk)
+);
+
+CREATE TABLE IF NOT EXISTS dossier_adjudication_item (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    adjudication_pk INTEGER NOT NULL REFERENCES dossier_adjudication(id),
+    dossier_pk      INTEGER NOT NULL REFERENCES dossier(id),
+    sample_code     TEXT NOT NULL,                     -- 仅限前两次复核有分歧的份项
+    item_index      INTEGER NOT NULL,                  -- 按案卷清单排序的序号（0 起）
+    passed          INTEGER NOT NULL CHECK (passed IN (0,1)),
+    fail_reason     TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_event_sample_time ON custody_event(sample_id, occurred_at, id);
 CREATE INDEX IF NOT EXISTS idx_version_sample ON sample_version(sample_id, version);
+CREATE INDEX IF NOT EXISTS idx_review_dossier ON dossier_review(dossier_pk, seq);
+CREATE INDEX IF NOT EXISTS idx_review_item_review ON dossier_review_item(review_pk, item_index);
+CREATE INDEX IF NOT EXISTS idx_adj_item_adj ON dossier_adjudication_item(adjudication_pk, item_index);
 """
 
 # 依赖迁移新列的索引（须在旧库补列迁移完成后再创建）

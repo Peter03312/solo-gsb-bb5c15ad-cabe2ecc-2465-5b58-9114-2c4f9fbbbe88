@@ -1,6 +1,6 @@
 # 样本交接链核验服务（Chain of Custody）
 
-面向环境检测机构的样本保管链核验服务：登记样本采集信息，接收**移交 / 签收 / 封签检查 / 实验室入库**四类带唯一事件号的事件，自动按发生时间重算证据链，输出**当前保管人**与 **有效（valid）/ 待补证（pending）/ 无效（invalid）**结论及原因；同一交接车次的多份样本支持**批量移交一次提交**（全局唯一批次号、统一移交时间/交出人/接收人，整批原子、同号幂等）；核定入库前支持对当前有效事件提交**作废 / 替换纠错**（永久留痕、仅有效版本参与核验）；仅有效链可核定入库，核定后历史冻结；全部真正提交按先后形成**不可变版本**，质控可按样本编号 + 版本号复核任一历史版本的结论、原因、保管人、有效时间线、纠错与核定信息（版本 0 起，核定后旧版仍可查）；同一抽检的多份样本可**封存为案卷**（至少两份、可逐份指定历史版本、整卷原子、按样本编号排序清单 + 完整快照 + 可复算 SHA-256 摘要，封存后任何写入不改变旧案卷）。
+面向环境检测机构的样本保管链核验服务：登记样本采集信息，接收**移交 / 签收 / 封签检查 / 实验室入库**四类带唯一事件号的事件，自动按发生时间重算证据链，输出**当前保管人**与 **有效（valid）/ 待补证（pending）/ 无效（invalid）**结论及原因；同一交接车次的多份样本支持**批量移交一次提交**（全局唯一批次号、统一移交时间/交出人/接收人，整批原子、同号幂等）；核定入库前支持对当前有效事件提交**作废 / 替换纠错**（永久留痕、仅有效版本参与核验）；仅有效链可核定入库，核定后历史冻结；全部真正提交按先后形成**不可变版本**，质控可按样本编号 + 版本号复核任一历史版本的结论、原因、保管人、有效时间线、纠错与核定信息（版本 0 起，核定后旧版仍可查）；同一抽检的多份样本可**封存为案卷**（至少两份、可逐份指定历史版本、整卷原子、按样本编号排序清单 + 完整快照 + 可复算 SHA-256 摘要，封存后任何写入不改变旧案卷）；质控再对**已封存案卷作双人独立复核**——两名不同复核人各提交一次卷内逐份通过/不通过完整清单（提交前核对案卷摘要、只依据封存快照、意见不可改、缺项/重复/重复复核人/越阶段整单拒绝），逐份一致即终局、分歧份项仅由未参与前两次复核的第三人裁决，全部份项终局后形成案卷结论（任一份不通过则案卷不通过）。
 
 技术栈：**Python 3.11 + FastAPI + SQLite（标准库 sqlite3）**，无外部服务依赖。
 
@@ -28,6 +28,8 @@
 | 入库核定 | 仅 `valid` 可核定；核定后该样本登记与事件全部**拒绝改写**（HTTP 409），重复核定幂等 |
 | 版本化复核 | 样本保管链按**提交先后**形成不可变版本：新登记样本从**版本 0**开始；升级前已有样本以**升级时状态**补建版本 0 基线，不推断更早历史。此后每次**真正提交**——单事件、批量移交中的该样本事件、作废/替换纠错、入库核定——各使受影响样本版本**递增一次**；同号同内容重试与失败操作**不产生版本**。补录事件的发生时间较早也**不改写旧版**；同批次各样本的版本与事件**一同提交或一同失败**。核定后旧版仍可查询 |
 | 案卷封存 | 同一抽检的多份样本（**至少两份、编号不重复**）一次封存为案卷：全局唯一**案卷号**，可逐份指定**非负历史版本**，未指定者取**封存事务中的最新版本**，整卷选取来自**同一数据库一致视图**。任一样本/版本不存在、编号重复 → **整卷失败且不留案卷**。案卷永久保存所选版本完整快照与**按样本编号排序的清单**，并生成**可复算的 SHA-256 摘要**；后续补录、纠错、核定**不改变旧案卷**。同案卷号同内容重试幂等（200，即使最新版本已变化也返回原卷，items 顺序不敏感），异内容 → 409；并发提交按已提交结果判定 |
+| 案卷双人复核 | 已封存案卷由**两名不同复核人各提交一次**卷内逐份**完整结论清单**（全局唯一**复核单号**、复核人标识、每份通过/不通过 + 不通过原因）。复核只依据**案卷封存的版本快照**：提交前须核对**案卷摘要**，客户端摘要与留存摘要不一致、或留存摘要按库存快照重算不过 → **拒绝写入**（`digest_mismatch`）。意见**提交后不可改**；**缺项、重复份项、卷外份项、重复复核人**（422，整单拒绝不留部分记录），**越阶段提交**（第三次复核 / 两次复核未完成就裁决 / 终局后再写，409）一律拒绝。同复核单号同内容重试 → 200 返回原结果（items 顺序不敏感），异内容（含跨案卷复用单号）→ 409；并发提交按**已提交状态**串行判定 |
+| 分歧与终局 | 两次复核的逐份意见（通过/不通过）**一致即形成该份终局结论**；有**分歧的份项**只允许**未参与前两次复核的第三人**裁决（全局唯一**裁决单号**，一次提交覆盖**全部分歧份项**的完整清单，同样先核对摘要；多裁/漏裁/重复/裁决人是前复核人 → 整单拒绝）。裁决提交后案卷**终局不可再写**；**全部份项终局后**才形成案卷结论，**任一份不通过则案卷不通过**。裁决同单号同内容重试幂等、异内容 409；无分歧可裁或已终局 → 409 越阶段 |
 
 > 说明：任何事件发生时间早于样本采集时间，直接记为无效（采集前不可能发生保管动作）。
 
@@ -546,6 +548,148 @@ curl -X POST http://localhost:8080/api/v1/dossiers/DOSSIER-20261001-01/verify
 
 核验按库存封存内容**重算摘要**并与留存摘要比对，返回一致与否（`match`）及两侧摘要；核验为只读操作，**不静默改写**任何存储内容——内容被篡改时报告 `match: false`，留存摘要与快照保持原样。
 
+### 5.9 已封存案卷双人独立复核（质控）
+
+质控人员对**已封存案卷**作双人独立复核：输入**案卷号、全局唯一复核单号、复核人标识**，以及**卷内每份样本**的通过/不通过结论和不通过原因。复核只依据案卷封存的版本快照——**提交前必须核对案卷摘要**，摘要不一致拒绝写入。每卷由**两名不同复核人各提交一次完整清单**，意见提交后不可改；逐份意见一致即形成该份终局结论；有分歧的份项只允许**未参与前两次复核的第三人**裁决；全部份项终局后才形成案卷结论，**任一份不通过则案卷不通过**。
+
+阶段流转：
+
+```
+awaiting_first  ──第1名复核人提交──▶  awaiting_second
+awaiting_second ──第2名不同复核人提交 ──▶  全部份项一致 ─▶ completed（案卷结论形成）
+                                          └ 存在分歧 ─▶ awaiting_adjudication
+awaiting_adjudication ──第三人裁决全部分歧份项──▶ completed（案卷结论形成）
+```
+
+#### 提交复核意见
+
+`POST /api/v1/dossiers/{dossier_id}/reviews`
+
+```bash
+curl -X POST http://localhost:8080/api/v1/dossiers/DOSSIER-20261001-01/reviews \
+  -H 'Content-Type: application/json' -d '{
+    "review_id":"REV-20261001-0001",
+    "reviewer":"质控员甲",
+    "digest":"9f2c…（GET 案卷得到的 64 位封存摘要）",
+    "items":[
+      {"sample_code":"S-001","passed":true},
+      {"sample_code":"S-002","passed":false,"fail_reason":"封存快照显示封签检查封签号不符"}
+    ]
+  }'
+```
+
+请求字段：
+
+| 字段 | 说明 |
+|---|---|
+| `review_id` | 全局唯一复核单号；同号同内容重试幂等、异内容冲突 |
+| `reviewer` | 复核人标识（非空）；同一案卷的两次提交必须是**两名不同复核人** |
+| `digest` | 提交前核对的**案卷 SHA-256 摘要**（来自 `GET /dossiers/{id}`）；与留存摘要不一致或库存重算不过 → `409 digest_mismatch` |
+| `items[]` | **卷内每份样本一条**：`sample_code`、`passed`（true/false）、`fail_reason`（不通过时**必填**，通过时必须为空） |
+
+- `201` 新提交；同复核单号同内容重试 `200`（`idempotent: true`，返回原进度）；同复核单号异内容（含改复核人、改任一结论或原因、跨案卷复用单号）→ `409 review_conflict`。
+- 复核只依据封存快照：案卷封存后样本补录/纠错/核定不影响复核，持原摘要即可提交。
+- 响应为当前**复核进度视图**（见下）。
+
+#### 复核进度 / 原始意见 / 分歧 / 终局结论查询
+
+`GET /api/v1/dossiers/{dossier_id}/reviews` —— 案卷维度的完整复核进度：
+
+```json
+{
+  "review_progress": {
+    "dossier_id": "DOSSIER-20261001-01",
+    "digest": "9f2c…",
+    "item_count": 2,
+    "stage": "awaiting_adjudication",
+    "completed": false,
+    "progress": {
+      "reviews_submitted": 2,
+      "required_reviews": 2,
+      "reviewers": ["质控员甲", "质控员乙"],
+      "disagreement_count": 1,
+      "finalized_items": 1,
+      "total_items": 2,
+      "adjudication_submitted": false
+    },
+    "reviews": [
+      {"review_id": "REV-…-0001", "seq": 0, "reviewer": "质控员甲", "digest_checked": "9f2c…",
+       "created_at": "…", "items": [{"index":0,"sample_code":"S-001","passed":true,"fail_reason":null}]},
+      {"review_id": "REV-…-0002", "seq": 1, "reviewer": "质控员乙", "…": "…"}
+    ],
+    "disagreements": [
+      {"index": 1, "sample_code": "S-002",
+       "opinions": [
+         {"review_id":"REV-…-0001","reviewer":"质控员甲","seq":0,"passed":false,"fail_reason":"…","created_at":"…"},
+         {"review_id":"REV-…-0002","reviewer":"质控员乙","seq":1,"passed":true,"fail_reason":null,"created_at":"…"}
+       ],
+       "adjudication": null}
+    ],
+    "adjudication": null,
+    "final_items": [
+      {"index": 0, "sample_code": "S-001", "passed": true, "fail_reason": null,
+       "decided_by": "review", "decided_by_id": null, "opinions": [ {"…": "两次原始意见…"} ]}
+    ],
+    "conclusion": null
+  }
+}
+```
+
+| 字段 | 含义 |
+|---|---|
+| `stage` | `awaiting_first` / `awaiting_second` / `awaiting_adjudication` / `completed` |
+| `progress` | 已提交复核次数（最多 2）、复核人列表、分歧份数、已终局份项数、裁决是否已提交 |
+| `reviews[]` | 两名复核人的**原始意见**（按提交先后 `seq` 0/1，含各自核对的摘要与逐份结论），提交后永不变更 |
+| `disagreements[]` | 两次意见不一致的份项：两人原始意见（含不通过原因），裁决后回填 `adjudication` |
+| `final_items[]` | **已终局**份项：`decided_by=review`（两人一致）或 `adjudication`（第三人裁决，附裁决单号），并保留原始意见链 |
+| `conclusion` | 仅全部份项终局后非空：`passed`、`passed_items/failed_items/failed_samples`、经裁决份项 `adjudicated_samples` 与终局时间；**任一份不通过则 `passed=false`** |
+
+按复核单号查询单次原始意见（不存在 → `404 review_not_found`）：
+
+```bash
+curl http://localhost:8080/api/v1/dossier-reviews/REV-20261001-0001
+# {"review": {…该次复核完整原始意见…}, "review_progress": {…所属案卷当前进度…}}
+```
+
+#### 第三人裁决
+
+`POST /api/v1/dossiers/{dossier_id}/adjudications`
+
+两次复核完成且存在分歧后，由**未参与前两次复核的第三人**一次提交覆盖**全部分歧份项**的裁决清单：
+
+```bash
+curl -X POST http://localhost:8080/api/v1/dossiers/DOSSIER-20261001-01/adjudications \
+  -H 'Content-Type: application/json' -d '{
+    "adjudication_id":"ADJ-20261001-0001",
+    "adjudicator":"质量主管丙",
+    "digest":"9f2c…",
+    "items":[
+      {"sample_code":"S-002","passed":false,"fail_reason":"复审封存快照确认封签不符，维持不通过"}
+    ]
+  }'
+```
+
+| 字段 | 说明 |
+|---|---|
+| `adjudication_id` | 全局唯一裁决单号；同号同内容重试幂等、异内容 → `409 adjudication_conflict` |
+| `adjudicator` | 裁决人标识，**不得等于任一前序复核人**（否则 422 `adjudication_rejected`） |
+| `digest` | 同样必须通过案卷摘要核对 |
+| `items[]` | 必须**恰好等于分歧份项集合**（缺项 `missing_adjudication_item` / 重复 `duplicate_sample_in_adjudication` / 裁决无分歧份项 `item_without_disagreement` → 422 整单拒绝）；字段规则与复核 items 相同 |
+
+- 裁决 `201` 后全部份项终局，响应即 `completed` 的复核进度视图与案卷 `conclusion`；同单号同内容重试 `200`。
+- 两次复核未完成、无分歧可裁（两人意见已一致）、已终局后再裁决/再复核 → `409 review_stage_violation`。
+
+规则与语义汇总：
+
+| 规则 | 行为 |
+|---|---|
+| 摘要核对 | 提交复核/裁决前比对 `digest`：与留存摘要不符，或留存摘要按库存快照重算不过（库存被篡改）→ `409 digest_mismatch`，拒绝写入；响应附 `submitted/stored/recomputed` 三侧摘要 |
+| 完整清单 | items 必须**恰好覆盖**卷内每份样本（裁决为每份分歧项）；缺项、重复份项、卷外份项 → `422 review_rejected` / `adjudication_rejected`，`details.items` 逐项给出 index/sample_code/code/message，事务回滚**不留部分记录**，失败单号不占用 |
+| 双人独立 | 每卷两条复核且复核人不同；重复复核人 → 422（明细 `duplicate_reviewer`）；第三次复核 → 409 越阶段 |
+| 意见不可改 | 同复核单号只能同内容幂等重试；异内容一律 409，库中原始意见不变 |
+| 裁决资格 | 仅两次复核之后、仅对分歧份项、裁决人必须是第三人；裁决后案卷终局，任一份不通过则案卷不通过 |
+| 并发 | 写事务 `BEGIN IMMEDIATE` 串行：同单号并发一建一幂等；复核第二席、裁决唯一槽位竞争均按**已提交状态**判定，落败方 409 且不留部分记录 |
+
 ### 错误响应统一格式
 
 ```json
@@ -569,6 +713,12 @@ curl -X POST http://localhost:8080/api/v1/dossiers/DOSSIER-20261001-01/verify
 | 404 | `dossier_not_found` | 案卷查询/核验的案卷号不存在 |
 | 409 | `dossier_conflict` | 同案卷号异内容重试（样本集合或任一份指定版本变化） |
 | 422 | `dossier_rejected` | 整卷失败：卷内样本编号重复（`duplicate_sample_in_dossier`，明细见 `details.items`）；样本/版本不存在分别按 `sample_not_found`/`version_not_found` 报 404，均不留案卷 |
+| 409 | `digest_mismatch` | 复核/裁决提交前案卷摘要核对不一致（提交摘要 ≠ 留存摘要，或留存摘要按库存快照重算不过）；拒绝写入，详情附三侧摘要 |
+| 409 | `review_conflict` / `adjudication_conflict` | 同复核单号/裁决单号异内容重试（改复核人/裁决人、改任一份结论或原因，或跨案卷复用单号）；意见已提交不可改 |
+| 409 | `review_stage_violation` | 越阶段提交：第三次复核、两次复核未完成即裁决、无分歧可裁、裁决终局后再复核/再裁决；并发下槽位被抢先亦按此拒绝 |
+| 422 | `review_rejected` | 复核整单失败：缺项（`missing_review_item`）/重复份项（`duplicate_sample_in_review`）/卷外份项（`unknown_review_item`）/重复复核人（`duplicate_reviewer`），逐项见 `details.items`，不留部分记录 |
+| 422 | `adjudication_rejected` | 裁决整单失败：裁决人是前两次复核人（`adjudicator_must_be_third`）/缺项（`missing_adjudication_item`）/重复（`duplicate_sample_in_adjudication`）/裁决无分歧份项（`item_without_disagreement`），不留部分记录 |
+| 404 | `review_not_found` | 按复核单号查询的单号不存在 |
 
 ---
 
@@ -580,7 +730,7 @@ curl -X POST http://localhost:8080/api/v1/dossiers/DOSSIER-20261001-01/verify
 python examples/call_api.py
 ```
 
-脚本依次演示：登记 → 移交 → 签收 → 封签检查 → 入库 → 幂等重试 → 冲突 → 查询证据链 → **纠错替换 / 同号幂等 / 链追溯 / 作废演示 / 纠错审计查询** → 核定 → 核定后改写与纠错被拒 → **批量移交提交 / 同号幂等 / 异内容冲突 / 整批失败 / 批次查询 / 批内作废后查询变化** → **保管链版本复核（版本索引、指定历史版本快照、当前最新版本、未知样本/版本报错）** → **案卷封存（指定/缺省版本封存、案卷查询、摘要核验、同号幂等重试、异内容冲突、整卷失败）**。也可直接在 http://localhost:8080/docs 的 Swagger UI 中点击调用。
+脚本依次演示：登记 → 移交 → 签收 → 封签检查 → 入库 → 幂等重试 → 冲突 → 查询证据链 → **纠错替换 / 同号幂等 / 链追溯 / 作废演示 / 纠错审计查询** → 核定 → 核定后改写与纠错被拒 → **批量移交提交 / 同号幂等 / 异内容冲突 / 整批失败 / 批次查询 / 批内作废后查询变化** → **保管链版本复核（版本索引、指定历史版本快照、当前最新版本、未知样本/版本报错）** → **案卷封存（指定/缺省版本封存、案卷查询、摘要核验、同号幂等重试、异内容冲突、整卷失败）** → **案卷双人独立复核（摘要核对、两次不同复核人完整清单、重复复核人/缺项/同号冲突拒绝、分歧进入裁决、第三人资格与裁决清单校验、裁决终局与案卷不通过、进度/单号查询）**。也可直接在 http://localhost:8080/docs 的 Swagger UI 中点击调用。
 
 版本复核也可用 curl 直接体验（完整脚本见下）：
 
@@ -600,6 +750,31 @@ curl http://localhost:8080/api/v1/dossiers/DOSSIER-001                     # 查
 curl -X POST http://localhost:8080/api/v1/dossiers/DOSSIER-001/verify      # 核验：重算摘要比对
 ```
 
+案卷双人独立复核 curl 速览（`digest` 取自案卷查询结果；两名复核人须不同，items 覆盖卷内每份）：
+
+```bash
+DG=$(curl -s http://localhost:8080/api/v1/dossiers/DOSSIER-001 | python3 -c 'import sys,json;print(json.load(sys.stdin)["dossier"]["digest"])')
+
+# 第 1 名复核人提交完整逐份清单
+curl -X POST http://localhost:8080/api/v1/dossiers/DOSSIER-001/reviews -H 'Content-Type: application/json' -d "{
+  \"review_id\":\"REV-0001\",\"reviewer\":\"质控员甲\",\"digest\":\"$DG\",
+  \"items\":[{\"sample_code\":\"S-001\",\"passed\":true},{\"sample_code\":\"S-002\",\"passed\":false,\"fail_reason\":\"封签号不符\"}]}"
+
+# 第 2 名不同复核人提交完整逐份清单（之后：逐份一致即终局；有分歧进入 awaiting_adjudication）
+curl -X POST http://localhost:8080/api/v1/dossiers/DOSSIER-001/reviews -H 'Content-Type: application/json' -d "{
+  \"review_id\":\"REV-0002\",\"reviewer\":\"质控员乙\",\"digest\":\"$DG\",
+  \"items\":[{\"sample_code\":\"S-001\",\"passed\":false,\"fail_reason\":\"时间线存疑\"},{\"sample_code\":\"S-002\",\"passed\":false,\"fail_reason\":\"封签号不符\"}]}"
+
+# 查询复核进度 / 原始意见 / 分歧 / 终局结论
+curl http://localhost:8080/api/v1/dossiers/DOSSIER-001/reviews
+curl http://localhost:8080/api/v1/dossier-reviews/REV-0001     # 按复核单号查原始意见
+
+# 第三人（不得是甲/乙）仅对分歧份项裁决；裁决后案卷终局
+curl -X POST http://localhost:8080/api/v1/dossiers/DOSSIER-001/adjudications -H 'Content-Type: application/json' -d "{
+  \"adjudication_id\":\"ADJ-0001\",\"adjudicator\":\"质量主管丙\",\"digest\":\"$DG\",
+  \"items\":[{\"sample_code\":\"S-001\",\"passed\":true}]}"
+```
+
 ---
 
 ## 七、自测
@@ -610,6 +785,7 @@ python -m tests.test_corrections    # 纠错：65 项断言（含并发）
 python -m tests.test_batches        # 批量移交：83 项断言（含并发）
 python -m tests.test_versions       # 版本复核：94 项断言（含旧库迁移基线）
 python -m tests.test_dossiers       # 案卷封存：61 项断言（含并发与篡改核验）
+python -m tests.test_reviews        # 案卷双人复核：100 项断言（含越阶段、摘要篡改与并发）
 ```
 
 - `test_chain` 覆盖 14 类场景：登记幂等/冲突、四类无效情形（非保管人移交、在途再移交、签收四要素不符、重复签收、封签不符/破损）、待补证两情形、乱序补录重算、核定准入与冻结、事件早于采集、无效优先等。
@@ -617,6 +793,7 @@ python -m tests.test_dossiers       # 案卷封存：61 项断言（含并发与
 - `test_batches` 覆盖：整批提交各份成为既有 transfer（逐份 pending/invalid 与在途信息、时间线批次归属）、整批失败四类原因（批内样本/事件号重复、样本不存在、已核定、事件号占用）且不留批次/事件/明细、冲突聚合与 409/422 优先、同批次号幂等（items 换序、时区归一、核定后仍 200）与异内容 409、批次查询随作废/替换更新（`event_effective`/`current_event_id`）与原始归属留痕、单事件接口对批量事件号 200/409、同批并发一建一幂等、异批事件号交叠一胜整批回滚、批次与核定并发按已提交顺序判定两种结局、载荷校验与失败批次号复用。
 - `test_versions` 覆盖：登记即版本 0（快照字段）、单事件每次真正提交 +1 而同号重试/冲突失败不产生版本、快照不可变且补录较早事件不改旧版（版本按提交先后、时间线按发生时间重排）、批量移交各样本版本随事件同提交/整批失败全不增/幂等不增/失败批次号修正后复用、替换与作废纠错 +1 而幂等与对失效事件纠错不增、核定 +1 而核定被拒/重复核定/冻结后写入不增、核定后全部旧版仍可查、版本索引/`latest`/指定版本端点、未知样本与不存在/非数字/负数版本号报错、快照完整字段、旧库迁移为已有样本补建 `baseline` 版本 0 且幂等、迁移后版本从 1 继续。
 - `test_dossiers` 覆盖：基本封存（指定/缺省版本、清单按样本编号排序、快照与版本复核一致、摘要可独立复算）、整卷失败五类（编号重复/样本不存在/版本不存在/份数不足/负数版本）且不留案卷与案卷号可复用、同号同内容（含换序）幂等且最新版本变化后仍返回原卷、异内容 409、封存后补录/纠错/核定不改变旧案卷、核验一致/篡改报不一致且不静默改写、不存在案卷查询与核验 404、同号同内容并发一建一幂等、同号异内容并发一建一冲突且遵循已提交结果、既有版本与写入接口行为保持。
+- `test_reviews` 覆盖：全程一致两审终局（全通过/含不通过，案卷结论与 `decided_by=review`）、0/1/2 审阶段切换与一次复核后裁决越阶段、摘要核对（错误摘要/封存后补录持原摘要仍可审/库存篡改重算不过均拒绝）、重复复核人与第三次复核拒绝、缺项/重复份项/卷外份项/载荷校验且整单失败不留头不留明细与单号可复用、同复核单号换序幂等与改结论/改复核人/改原因/跨案卷复用 409 且原意见不变、分歧集合计算与原始意见、第三人资格（前复核人 422）、裁决清单须恰好覆盖分歧（缺/多/重复 422）、裁决摘要核对、失败裁决不留记录、第三人裁决终局（裁决原因保留、失败份项汇总、案卷不通过、分歧回填裁决）、终局后再裁决/再复核 409、裁决同号换序幂等与异内容 409、进度/单号查询与 `review_not_found`、同单号并发一建一幂等、第二席竞争按已提交状态、两裁决并发一胜一负且遵循已提交结果、既有接口行为保持。
 
 ---
 
@@ -629,16 +806,18 @@ python -m tests.test_dossiers       # 案卷封存：61 项断言（含并发与
 │   ├── service.py    # 核心领域逻辑：幂等指纹、保管链重算、纠错（作废/替换）、核定冻结、批量移交
 │   ├── versions.py   # 保管链版本：版本快照记录、版本 0 基线迁移、版本索引/指定版本查询
 │   ├── dossiers.py   # 案卷封存：整卷原子封存、按编号排序清单、SHA-256 摘要与核验、同号幂等/冲突
-│   ├── schemas.py    # 请求模型：事件、纠错（NewEventIn/CorrectionIn）、批量移交（TransferBatchIn）、案卷（DossierIn）按类型必填校验
-│   ├── db.py         # SQLite 连接、建表与旧库迁移（批次表、版本表与基线补建、案卷表）、IMMEDIATE 事务
+│   ├── reviews.py    # 案卷双人独立复核：摘要核对、两次完整清单、逐份一致/分歧、第三人裁决与终局结论
+│   ├── schemas.py    # 请求模型：事件、纠错（NewEventIn/CorrectionIn）、批量移交（TransferBatchIn）、案卷（DossierIn）、复核/裁决（ReviewIn/AdjudicationIn）按类型必填校验
+│   ├── db.py         # SQLite 连接、建表与旧库迁移（批次表、版本表与基线补建、案卷表、复核与裁决表）、IMMEDIATE 事务
 │   ├── seed.py       # 演示数据初始化（幂等）
 │   └── config.py     # 环境变量配置
-├── examples/call_api.py   # 零依赖调用示例（含纠错、批量移交、版本复核与案卷封存全流程）
+├── examples/call_api.py   # 零依赖调用示例（含纠错、批量移交、版本复核、案卷封存与双人复核/第三人裁决全流程）
 ├── tests/test_chain.py    # 既有规则端到端自测（42 项断言）
 ├── tests/test_corrections.py  # 纠错端到端自测（65 项断言，含并发）
 ├── tests/test_batches.py  # 批量移交端到端自测（83 项断言，含并发）
 ├── tests/test_versions.py # 保管链版本复核端到端自测（94 项断言，含旧库迁移）
 ├── tests/test_dossiers.py # 案卷封存端到端自测（61 项断言，含并发与篡改核验）
+├── tests/test_reviews.py  # 案卷双人独立复核端到端自测（100 项断言，含越阶段、摘要篡改与并发）
 ├── entrypoint.sh     # 容器入口：建表 → 演示数据 → 启动
 ├── Dockerfile
 ├── docker-compose.yml

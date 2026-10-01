@@ -374,6 +374,137 @@ def main() -> None:
     s, r = call("GET", f"/dossiers/API-DOSSIER-BAD-{run_id}")
     print("失败不留案卷（查询 404）:", s, r.get("error", {}).get("code"))
 
+    # 15) 案卷双人独立复核（质控）：两名不同复核人各提交一次逐份完整清单
+    print("\n=== 案卷双人独立复核 ===")
+    # 准备一卷两份样本（不封存 code/code2，避免与前序核定状态耦合，使用独立样本）
+    rev_codes = [f"API-REV-{run_id}-A", f"API-REV-{run_id}-B"]
+    for i, rc in enumerate(rev_codes):
+        call("POST", "/samples", {
+            "sample_code": rc,
+            "collected_at": "2026-09-30T01:00:00Z",
+            "collector": "王采集",
+            "seal_no": f"SEAL-REV-{run_id}-{i}",
+        })
+    review_dossier_id = f"API-REV-DOSSIER-{run_id}"
+    s, r = call("POST", "/dossiers", {
+        "dossier_id": review_dossier_id,
+        "items": [{"sample_code": rev_codes[0]}, {"sample_code": rev_codes[1]}],
+    })
+    review_digest = r["dossier"]["digest"]
+    print(f"--- 待复核案卷封存 [HTTP {s}] 案卷号={review_dossier_id} 摘要={review_digest[:16]}… ---")
+
+    def rv_items(verdict_a, verdict_b):
+        """verdict = (passed, fail_reason)；组装按样本编号的两份结论。"""
+        items = []
+        for code, (passed, reason) in zip(rev_codes, (verdict_a, verdict_b)):
+            body = {"sample_code": code, "passed": passed}
+            if reason:
+                body["fail_reason"] = reason
+            items.append(body)
+        return items
+
+    # 15.0) 复核前进度
+    s, r = call("GET", f"/dossiers/{review_dossier_id}/reviews")
+    print("初始阶段:", r["review_progress"]["stage"],
+          "| 已提交复核:", r["review_progress"]["progress"]["reviews_submitted"])
+
+    # 15.1) 摘要不一致拒绝写入（客户端拿错版本）
+    s, r = call("POST", f"/dossiers/{review_dossier_id}/reviews", {
+        "review_id": f"API-RV-BAD-{run_id}", "reviewer": "质控员甲",
+        "digest": "0" * 64,
+        "items": rv_items((True, None), (True, None)),
+    })
+    print("摘要不一致:", s, r.get("error", {}).get("code"))
+
+    # 15.2) 第一次复核：甲判 A 通过、B 不通过
+    review_body_1 = {
+        "review_id": f"API-RV-1-{run_id}", "reviewer": "质控员甲",
+        "digest": review_digest,
+        "items": rv_items((True, None), (False, "封签号与登记不一致")),
+    }
+    s, r = call("POST", f"/dossiers/{review_dossier_id}/reviews", review_body_1)
+    print("第一次复核:", s, "| 阶段:", r["review_progress"]["stage"],
+          "| 复核人:", r["review_progress"]["progress"]["reviewers"])
+
+    # 15.3) 同一复核人不得提交第二次（须两名不同复核人独立复核）
+    s, r = call("POST", f"/dossiers/{review_dossier_id}/reviews", {
+        "review_id": f"API-RV-DUP-{run_id}", "reviewer": "质控员甲",
+        "digest": review_digest,
+        "items": rv_items((True, None), (False, "封签号与登记不一致")),
+    })
+    print("重复复核人:", s, r.get("error", {}).get("code"),
+          "| 明细:", r.get("error", {}).get("details", {}).get("items", [{}])[0].get("code"))
+
+    # 15.4) 缺项整单拒绝（不留下部分记录）
+    s, r = call("POST", f"/dossiers/{review_dossier_id}/reviews", {
+        "review_id": f"API-RV-MISS-{run_id}", "reviewer": "质控员乙",
+        "digest": review_digest,
+        "items": [{"sample_code": rev_codes[0], "passed": True}],
+    })
+    print("清单缺项:", s, r.get("error", {}).get("code"),
+          "| 明细:", [i.get("code") for i in r.get("error", {}).get("details", {}).get("items", [])])
+
+    # 15.5) 第二次复核：乙判 A 不通过（与甲分歧）、B 不通过（与甲一致）
+    s, r = call("POST", f"/dossiers/{review_dossier_id}/reviews", {
+        "review_id": f"API-RV-2-{run_id}", "reviewer": "质控员乙",
+        "digest": review_digest,
+        "items": rv_items((False, "保管链时间线异常"), (False, "封签确有破损")),
+    })
+    p2 = r["review_progress"]
+    print("第二次复核:", s, "| 阶段:", p2["stage"],
+          "| 分歧份项:", [d["sample_code"] for d in p2["disagreements"]],
+          "| 已终局:", [it["sample_code"] for it in p2["final_items"]])
+
+    # 15.6) 同复核单号同内容重试 → 200 幂等返回原结果
+    s, r = call("POST", f"/dossiers/{review_dossier_id}/reviews", review_body_1)
+    print("同单号同内容重试:", s, "| 幂等:", r.get("idempotent"))
+    # 同复核单号异内容 → 409（意见提交后不可改）
+    changed = json.loads(json.dumps(review_body_1))
+    changed["items"][0]["passed"] = False
+    changed["items"][0]["fail_reason"] = "改判"
+    s, r = call("POST", f"/dossiers/{review_dossier_id}/reviews", changed)
+    print("同单号异内容:", s, r.get("error", {}).get("code"))
+
+    # 15.7) 分歧只能由未参与前两次复核的第三人裁决；裁决清单须恰好覆盖分歧份项
+    s, r = call("POST", f"/dossiers/{review_dossier_id}/adjudications", {
+        "adjudication_id": f"API-ADJ-SELF-{run_id}", "adjudicator": "质控员甲",
+        "digest": review_digest,
+        "items": [{"sample_code": rev_codes[0], "passed": True}],
+    })
+    print("前复核人裁决:", s, r.get("error", {}).get("code"))
+    s, r = call("POST", f"/dossiers/{review_dossier_id}/adjudications", {
+        "adjudication_id": f"API-ADJ-1-{run_id}", "adjudicator": "质控主管丙",
+        "digest": review_digest,
+        "items": [{"sample_code": rev_codes[0], "passed": True}],   # 丙终裁 A 通过
+    })
+    p3 = r["review_progress"]
+    print("第三人裁决:", s, "| 阶段:", p3["stage"])
+    print("案卷终局结论:", json.dumps(p3["conclusion"], ensure_ascii=False))
+    for it in p3["final_items"]:
+        print(f"    {it['sample_code']}: {'通过' if it['passed'] else '不通过'}"
+              f"（由{'裁决' if it['decided_by'] == 'adjudication' else '两人一致意见'}终局）"
+              + (f" 原因={it['fail_reason']}" if it["fail_reason"] else ""))
+
+    # 15.8) 终局后越阶段提交（再复核/再裁决）拒绝
+    s, r = call("POST", f"/dossiers/{review_dossier_id}/reviews", {
+        "review_id": f"API-RV-3-{run_id}", "reviewer": "质控员丁",
+        "digest": review_digest,
+        "items": rv_items((True, None), (True, None)),
+    })
+    print("终局后再复核:", s, r.get("error", {}).get("code"))
+
+    # 15.9) 查询：复核进度 / 原始意见 / 分歧 / 终局结论；按复核单号查原始意见
+    s, r = call("GET", f"/dossiers/{review_dossier_id}/reviews")
+    print(f"\n--- 复核进度查询 [HTTP {s}] ---")
+    pp = r["review_progress"]
+    print("阶段:", pp["stage"], "| 复核人:", pp["progress"]["reviewers"],
+          "| 案卷通过:", pp["conclusion"]["passed"],
+          "| 不通过份项:", pp["conclusion"]["failed_samples"])
+    s, r = call("GET", f"/dossier-reviews/API-RV-2-{run_id}")
+    print(f"--- 按复核单号查询 [HTTP {s}] ---")
+    print("单号:", r["review"]["review_id"], "| 复核人:", r["review"]["reviewer"],
+          "| 意见:", [(i["sample_code"], i["passed"], i["fail_reason"]) for i in r["review"]["items"]])
+
 
 if __name__ == "__main__":
     main()

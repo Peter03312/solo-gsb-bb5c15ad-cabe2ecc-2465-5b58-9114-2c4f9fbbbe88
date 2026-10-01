@@ -182,3 +182,73 @@ class DossierIn(BaseModel):
 
     dossier_id: str = Field(..., min_length=1, description="全局唯一案卷号，同号重试幂等")
     items: list[DossierItemIn] = Field(..., min_length=2, description="卷内样本（至少两份，编号不重复）")
+
+
+class ReviewItemIn(BaseModel):
+    """案卷复核清单中的一份样本结论：通过/不通过 + 不通过原因。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    sample_code: str = Field(..., min_length=1, description="卷内样本编号，须命中案卷封存清单")
+    passed: bool = Field(..., description="true=通过，false=不通过")
+    fail_reason: str | None = Field(None, description="不通过原因；不通过时必填，通过时必须为空")
+
+    @model_validator(mode="after")
+    def _check_fail_reason(self) -> "ReviewItemIn":
+        if not self.passed and not (self.fail_reason and self.fail_reason.strip()):
+            raise ValueError("不通过（passed=false）的份项必须填写 fail_reason（不通过原因）")
+        if self.passed and self.fail_reason is not None:
+            raise ValueError("通过（passed=true）的份项不得携带 fail_reason")
+        return self
+
+
+class ReviewIn(BaseModel):
+    """已封存案卷的双人独立复核：一名复核人一次提交卷内每份样本的完整结论清单。
+
+    * 复核单号全局唯一；每卷由两名不同复核人各提交一次（按提交先后记为第 1/2 次）；
+    * 复核只依据案卷封存的版本快照：提交前必须核对案卷摘要（digest），不一致拒绝写入；
+    * items 必须完整覆盖卷内每份样本且不重复（缺项/重复份项整单拒绝，不留部分记录）；
+    * 同复核单号同内容重试幂等（200），异内容冲突（409）；意见提交后不可改。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    review_id: str = Field(..., min_length=1, description="全局唯一复核单号，同号重试幂等")
+    reviewer: str = Field(..., min_length=1, description="复核人标识；同卷两次复核人必须不同")
+    digest: str = Field(..., min_length=1, description="提交前核对的案卷 SHA-256 摘要（须与封存摘要一致）")
+    items: list[ReviewItemIn] = Field(..., min_length=1, description="卷内每份样本的复核结论（完整清单）")
+
+
+class AdjudicationItemIn(BaseModel):
+    """第三人裁决清单中的一份：仅允许覆盖前两次复核有分歧的份项。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    sample_code: str = Field(..., min_length=1, description="分歧份项的样本编号")
+    passed: bool = Field(..., description="true=通过，false=不通过（裁决终局结论）")
+    fail_reason: str | None = Field(None, description="不通过原因；不通过时必填，通过时必须为空")
+
+    @model_validator(mode="after")
+    def _check_fail_reason(self) -> "AdjudicationItemIn":
+        if not self.passed and not (self.fail_reason and self.fail_reason.strip()):
+            raise ValueError("不通过（passed=false）的裁决份项必须填写 fail_reason（不通过原因）")
+        if self.passed and self.fail_reason is not None:
+            raise ValueError("通过（passed=true）的裁决份项不得携带 fail_reason")
+        return self
+
+
+class AdjudicationIn(BaseModel):
+    """分歧份项的第三人裁决：两次复核均提交后，由未参与前两次复核的第三人，
+    一次提交覆盖全部分歧份项的完整裁决清单。
+
+    * 裁决单号全局唯一；提交前必须核对案卷摘要（digest），不一致拒绝写入；
+    * items 必须恰好等于前两次复核有分歧的份项集合（多/缺/重复整单拒绝，不留部分记录）；
+    * 同裁决单号同内容重试幂等（200），异内容冲突（409）；裁决提交后案卷终局。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    adjudication_id: str = Field(..., min_length=1, description="全局唯一裁决复核单号，同号重试幂等")
+    adjudicator: str = Field(..., min_length=1, description="裁决人标识；不得为前两次复核人")
+    digest: str = Field(..., min_length=1, description="提交前核对的案卷 SHA-256 摘要（须与封存摘要一致）")
+    items: list[AdjudicationItemIn] = Field(..., min_length=1, description="全部分歧份项的裁决结论（完整清单）")
